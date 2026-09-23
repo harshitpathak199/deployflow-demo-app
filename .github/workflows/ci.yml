@@ -1,7 +1,7 @@
 name: DeployFlow - CI Pipeline
 
 # Run automatically when code is pushed to main.
-# Also allow the workflow to be started manually.
+# Also allow manual execution.
 on:
   push:
     branches:
@@ -9,7 +9,6 @@ on:
 
   workflow_dispatch:
 
-# The workflow only needs to read repository contents.
 permissions:
   contents: read
 
@@ -23,7 +22,7 @@ jobs:
 
     steps:
 
-      # STEP 1: Download the repository code.
+      # STEP 1: Download source code.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -44,14 +43,13 @@ jobs:
       - name: Run automated tests
         run: npm test
 
-      # STEP 5: Verify Docker is available.
+      # STEP 5: Verify Docker installation.
       - name: Check Docker installation
         run: |
           docker --version
           docker info
 
       # STEP 6: Build the Docker image.
-      # The commit SHA identifies the exact source version.
       - name: Build Docker image
         run: |
           docker build \
@@ -62,32 +60,121 @@ jobs:
       # STEP 7: Start the Docker container.
       - name: Run Docker container
         run: |
+          echo "Starting Docker container..."
+
           docker run \
             --detach \
             --name deployflow-ci \
             --publish 127.0.0.1:3000:3000 \
             "deployflow-demo:$GITHUB_SHA"
 
-      # STEP 8: Check application health.
+          echo "Container startup command completed."
+
+      # STEP 8: Wait for application readiness.
       - name: Verify container health
+        shell: bash
         run: |
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --retry 10 \
-            --retry-connrefused \
-            --retry-delay 2 \
-            http://127.0.0.1:3000/health \
-            | tee health-response.json
+          echo "Waiting for the application to become healthy..."
 
-          grep -q '"status":"healthy"' health-response.json
+          HEALTHY=false
 
-          grep -q "$GITHUB_SHA" health-response.json
+          for attempt in $(seq 1 30); do
+
+            echo "Health check attempt: $attempt"
+
+            # Verify that the container is still running.
+            CONTAINER_RUNNING=$(docker inspect \
+              --format '{{.State.Running}}' \
+              deployflow-ci 2>/dev/null || echo "false")
+
+            if [ "$CONTAINER_RUNNING" != "true" ]; then
+
+              echo "ERROR: Docker container is not running."
+
+              docker ps -a
+
+              docker logs deployflow-ci || true
+
+              exit 1
+
+            fi
+
+            # Attempt to access the application's health endpoint.
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 3 \
+              --output health-response.json \
+              http://127.0.0.1:3000/health; then
+
+              echo "Application responded."
+
+              cat health-response.json
+
+              # Validate health status and deployed commit.
+              if node -e '
+                const fs = require("fs");
+
+                const response = JSON.parse(
+                  fs.readFileSync(
+                    "health-response.json",
+                    "utf8"
+                  )
+                );
+
+                if (
+                  response.status !== "healthy" ||
+                  response.commit !== process.env.GITHUB_SHA
+                ) {
+                  process.exit(1);
+                }
+              '; then
+
+                echo "Application health verified."
+
+                HEALTHY=true
+
+                break
+
+              fi
+
+              echo "Health response did not match expected values."
+
+            else
+
+              echo "Application is not ready yet."
+
+            fi
+
+            sleep 2
+
+          done
+
+          # Fail if the application never became healthy.
+          if [ "$HEALTHY" != "true" ]; then
+
+            echo "ERROR: Application failed its health check."
+
+            echo "Docker container status:"
+
+            docker ps -a
+
+            echo "Docker container details:"
+
+            docker inspect deployflow-ci || true
+
+            echo "Docker application logs:"
+
+            docker logs deployflow-ci || true
+
+            exit 1
+
+          fi
 
           echo "Docker container health check passed."
 
-      # STEP 9: Save a summary of the CI execution.
+      # STEP 9: Generate CI summary.
       - name: Generate CI summary
         run: |
           echo "## DeployFlow CI Pipeline" >> "$GITHUB_STEP_SUMMARY"
@@ -102,15 +189,18 @@ jobs:
 
           echo "Container health: PASSED" >> "$GITHUB_STEP_SUMMARY"
 
-      # STEP 10: Always display container logs.
-      # This also helps troubleshoot failures.
+      # STEP 10: Show application logs.
       - name: Display Docker logs
         if: always()
         run: |
+          echo "Docker container logs:"
+
           docker logs deployflow-ci 2>/dev/null || true
 
-      # STEP 11: Remove the temporary test container.
+      # STEP 11: Remove temporary Docker container.
       - name: Clean up Docker container
         if: always()
         run: |
           docker rm -f deployflow-ci 2>/dev/null || true
+
+          echo "Temporary container cleanup completed."
