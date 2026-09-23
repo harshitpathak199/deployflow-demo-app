@@ -1,0 +1,116 @@
+name: DeployFlow - CI Pipeline
+
+# Run automatically when code is pushed to main.
+# Also allow the workflow to be started manually.
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+# The workflow only needs to read repository contents.
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Test and Build Application
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    steps:
+
+      # STEP 1: Download the repository code.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # STEP 2: Install Node.js.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # STEP 3: Install project dependencies.
+      - name: Install dependencies
+        run: npm ci
+
+      # STEP 4: Run automated tests.
+      - name: Run automated tests
+        run: npm test
+
+      # STEP 5: Verify Docker is available.
+      - name: Check Docker installation
+        run: |
+          docker --version
+          docker info
+
+      # STEP 6: Build the Docker image.
+      # The commit SHA identifies the exact source version.
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg "GIT_SHA=$GITHUB_SHA" \
+            --tag "deployflow-demo:$GITHUB_SHA" \
+            .
+
+      # STEP 7: Start the Docker container.
+      - name: Run Docker container
+        run: |
+          docker run \
+            --detach \
+            --name deployflow-ci \
+            --publish 127.0.0.1:3000:3000 \
+            "deployflow-demo:$GITHUB_SHA"
+
+      # STEP 8: Check application health.
+      - name: Verify container health
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 10 \
+            --retry-connrefused \
+            --retry-delay 2 \
+            http://127.0.0.1:3000/health \
+            | tee health-response.json
+
+          grep -q '"status":"healthy"' health-response.json
+
+          grep -q "$GITHUB_SHA" health-response.json
+
+          echo "Docker container health check passed."
+
+      # STEP 9: Save a summary of the CI execution.
+      - name: Generate CI summary
+        run: |
+          echo "## DeployFlow CI Pipeline" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Node.js: 22" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Automated tests: PASSED" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Docker build: PASSED" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Container health: PASSED" >> "$GITHUB_STEP_SUMMARY"
+
+      # STEP 10: Always display container logs.
+      # This also helps troubleshoot failures.
+      - name: Display Docker logs
+        if: always()
+        run: |
+          docker logs deployflow-ci 2>/dev/null || true
+
+      # STEP 11: Remove the temporary test container.
+      - name: Clean up Docker container
+        if: always()
+        run: |
+          docker rm -f deployflow-ci 2>/dev/null || true
