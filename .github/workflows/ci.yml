@@ -1,7 +1,5 @@
 name: DeployFlow - CI Pipeline
 
-# Run automatically when code is pushed to main.
-# Also allow manual execution.
 on:
   push:
     branches:
@@ -11,14 +9,23 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+
+concurrency:
+  group: deployflow-ci-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   ci:
-    name: Test and Build Application
+    name: Test, Build and Push Docker Image
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 15
+    timeout-minutes: 25
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
 
     steps:
 
@@ -35,7 +42,7 @@ jobs:
           node-version: "22"
           cache: npm
 
-      # STEP 3: Install project dependencies.
+      # STEP 3: Install dependencies.
       - name: Install dependencies
         run: npm ci
 
@@ -43,13 +50,13 @@ jobs:
       - name: Run automated tests
         run: npm test
 
-      # STEP 5: Verify Docker installation.
+      # STEP 5: Verify Docker.
       - name: Check Docker installation
         run: |
           docker --version
           docker info
 
-      # STEP 6: Build the Docker image.
+      # STEP 6: Build Docker image.
       - name: Build Docker image
         run: |
           docker build \
@@ -57,49 +64,36 @@ jobs:
             --tag "deployflow-demo:$GITHUB_SHA" \
             .
 
-      # STEP 7: Start the Docker container.
+      # STEP 7: Start test container.
       - name: Run Docker container
         run: |
-          echo "Starting Docker container..."
-
           docker run \
             --detach \
             --name deployflow-ci \
             --publish 127.0.0.1:3000:3000 \
             "deployflow-demo:$GITHUB_SHA"
 
-          echo "Container startup command completed."
-
-      # STEP 8: Wait for application readiness.
+      # STEP 8: Verify container health.
       - name: Verify container health
         shell: bash
         run: |
-          echo "Waiting for the application to become healthy..."
-
           HEALTHY=false
 
           for attempt in $(seq 1 30); do
 
             echo "Health check attempt: $attempt"
 
-            # Verify that the container is still running.
             CONTAINER_RUNNING=$(docker inspect \
               --format '{{.State.Running}}' \
               deployflow-ci 2>/dev/null || echo "false")
 
             if [ "$CONTAINER_RUNNING" != "true" ]; then
-
-              echo "ERROR: Docker container is not running."
-
+              echo "ERROR: Container is not running."
               docker ps -a
-
               docker logs deployflow-ci || true
-
               exit 1
-
             fi
 
-            # Attempt to access the application's health endpoint.
             if curl \
               --fail \
               --silent \
@@ -108,19 +102,11 @@ jobs:
               --output health-response.json \
               http://127.0.0.1:3000/health; then
 
-              echo "Application responded."
-
-              cat health-response.json
-
-              # Validate health status and deployed commit.
               if node -e '
                 const fs = require("fs");
 
                 const response = JSON.parse(
-                  fs.readFileSync(
-                    "health-response.json",
-                    "utf8"
-                  )
+                  fs.readFileSync("health-response.json", "utf8")
                 );
 
                 if (
@@ -131,19 +117,12 @@ jobs:
                 }
               '; then
 
-                echo "Application health verified."
-
                 HEALTHY=true
-
+                echo "Application health verified."
+                cat health-response.json
                 break
 
               fi
-
-              echo "Health response did not match expected values."
-
-            else
-
-              echo "Application is not ready yet."
 
             fi
 
@@ -151,37 +130,95 @@ jobs:
 
           done
 
-          # Fail if the application never became healthy.
           if [ "$HEALTHY" != "true" ]; then
-
-            echo "ERROR: Application failed its health check."
-
-            echo "Docker container status:"
-
+            echo "ERROR: Application health check failed."
             docker ps -a
-
-            echo "Docker container details:"
-
-            docker inspect deployflow-ci || true
-
-            echo "Docker application logs:"
-
             docker logs deployflow-ci || true
+            exit 1
+          fi
 
+          echo "Container health check passed."
+
+      # STEP 9: Remove temporary test container.
+      - name: Remove test container
+        if: always()
+        run: |
+          docker rm -f deployflow-ci 2>/dev/null || true
+
+      # STEP 10: Authenticate with AWS using OIDC.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "541293890816"
+
+      # STEP 11: Verify AWS authentication.
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # STEP 12: Log in to Amazon ECR.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # STEP 13: Check whether the image already exists.
+      - name: Check existing image
+        id: image-check
+        shell: bash
+        run: |
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$GITHUB_SHA" \
+            > image-description.json 2> image-error.txt; then
+
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image already exists in ECR."
+
+          elif grep -q 'ImageNotFoundException' image-error.txt; then
+
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image does not exist. Upload required."
+
+          else
+
+            echo "Unable to check ECR image."
+            cat image-error.txt
             exit 1
 
           fi
 
-          echo "Docker container health check passed."
+      # STEP 14: Upload Docker image to ECR.
+      - name: Push Docker image to ECR
+        if: steps.image-check.outputs.exists == 'false'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        shell: bash
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
 
-      # STEP 9: Generate CI summary.
+          docker tag \
+            "deployflow-demo:$GITHUB_SHA" \
+            "$IMAGE_URI"
+
+          docker push "$IMAGE_URI"
+
+          echo "Uploaded image: $IMAGE_URI"
+
+      # STEP 15: Verify uploaded image.
+      - name: Verify ECR image
+        run: |
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$GITHUB_SHA"
+
+      # STEP 16: Generate CI summary.
       - name: Generate CI summary
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           echo "## DeployFlow CI Pipeline" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Node.js: 22" >> "$GITHUB_STEP_SUMMARY"
 
           echo "Automated tests: PASSED" >> "$GITHUB_STEP_SUMMARY"
 
@@ -189,18 +226,9 @@ jobs:
 
           echo "Container health: PASSED" >> "$GITHUB_STEP_SUMMARY"
 
-      # STEP 10: Show application logs.
-      - name: Display Docker logs
-        if: always()
-        run: |
-          echo "Docker container logs:"
+          echo "ECR image: VERIFIED" >> "$GITHUB_STEP_SUMMARY"
 
-          docker logs deployflow-ci 2>/dev/null || true
+          echo "Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
 
-      # STEP 11: Remove temporary Docker container.
-      - name: Clean up Docker container
-        if: always()
-        run: |
-          docker rm -f deployflow-ci 2>/dev/null || true
-
-          echo "Temporary container cleanup completed."
+          echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
+            >> "$GITHUB_STEP_SUMMARY"
